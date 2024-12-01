@@ -42,7 +42,6 @@ combined_db_config = {
 
 def fetch_and_insert_data():
     try:
-        # Loop through each source database
         for config_name, config in configs.items():
             try:
                 source_conn = psycopg2.connect(**config)
@@ -52,19 +51,15 @@ def fetch_and_insert_data():
                     with source_conn.cursor() as source_cursor, combined_conn.cursor() as combined_cursor:
                         print(f"Fetching incremental data from {config_name}...")
 
-                        # Get the last update time for this source
+                        # Get last update time
                         combined_cursor.execute("""
                             SELECT MAX(last_updated)
                             FROM combined_cars
                             WHERE source_db = %s;
                         """, (config_name,))
-                        last_updated_time = combined_cursor.fetchone()[0]
+                        last_updated_time = combined_cursor.fetchone()[0] or '1970-01-01 00:00:00'
 
-                        # Default to a very old date if no records are present
-                        if not last_updated_time:
-                            last_updated_time = '1970-01-01 00:00:00'
-
-                        # Fetch only records updated after the last update
+                        # Fetch updated records
                         fetch_query = ""
                         if config_name == "config_v2":
                             fetch_query = f"""
@@ -100,14 +95,50 @@ def fetch_and_insert_data():
                                 price = EXCLUDED.price,
                                 mileage = EXCLUDED.mileage,
                                 condition = EXCLUDED.condition,
-                                last_updated = EXCLUDED.last_updated;
+                                last_updated = EXCLUDED.last_updated
+                            RETURNING car_model;
                         """
-                        combined_cursor.executemany(insert_query, rows)
-                        combined_conn.commit()
+                        updated_models = []
+                        if rows:
+                            combined_cursor.executemany(insert_query, rows)
+                            updated_models = [row[0] for row in rows]
+                        print(f"Updated models from {config_name}: {updated_models}")
 
-                        print(f"Incremental data inserted/updated successfully from {config_name}!")
+                        # Fetch current records from source to identify deletions
+                        source_cursor.execute("""
+                            SELECT car_model
+                            FROM car_details_v2
+                        """ if config_name == "config_v2" else """
+                            SELECT name AS car_model
+                            FROM car_details_v3
+                        """ if config_name == "config_v3" else """
+                            SELECT model AS car_model
+                            FROM car_details
+                        """)
+                        source_records = {row[0] for row in source_cursor.fetchall()}
+
+                        # Fetch current records in the combined database
+                        combined_cursor.execute("""
+                            SELECT car_model
+                            FROM combined_cars
+                            WHERE source_db = %s;
+                        """, (config_name,))
+                        combined_records = {row[0] for row in combined_cursor.fetchall()}
+
+                        # Identify and delete outdated records
+                        outdated_records = combined_records - source_records
+                        if outdated_records:
+                            delete_query = """
+                                DELETE FROM combined_cars
+                                WHERE car_model = %s AND source_db = %s;
+                            """
+                            combined_cursor.executemany(delete_query, [(record, config_name) for record in outdated_records])
+                            print(f"Deleted records from {config_name}: {outdated_records}")
+                        
+                        combined_conn.commit()
+                        print(f"Incremental data processed successfully for {config_name}!")
             except Exception as e:
-                print(f"Error fetching incremental data from {config_name}: {e}")
+                print(f"Error processing data from {config_name}: {e}")
     except Exception as e:
         print(f"Error: {e}")
 
